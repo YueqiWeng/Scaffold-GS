@@ -1,0 +1,12 @@
+# Minimal conda env for RTX 50-series. After creation, run: bash install_rtx50.sh
+name: scaffold_gs
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.11
+  - pip
+  - gxx_linux-64=13.2.0
+  - ninja
+  - cuda-nvcc=12.8
+  - cuda-cudart-dev

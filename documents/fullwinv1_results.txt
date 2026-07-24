@@ -1,0 +1,25 @@
+================================================================================
+ FULLWINV1 — canonical MipNeRF360 dynamic results (6/7 vs flat MoE)
+================================================================================
+
+Official dynamic stamps (after archiving fullwin2 start-8 runs):
+
+  bicycle   2026-07-18_13:23:04   MoE 25.22 → dyn 25.28   +0.06
+  bonsai    2026-07-18_17:49:15   MoE 33.18 → dyn 33.33   +0.14
+  counter   2026-07-18_22:05:07   MoE 29.58 → dyn 29.99   +0.41
+  garden    2026-07-20_16:50:54   MoE 27.48 → dyn 27.57   +0.09
+  kitchen   2026-07-19_07:47:47   MoE 31.86 → dyn 31.92   +0.05
+  room      2026-07-19_11:40:41   MoE 32.23 → dyn 32.54   +0.31
+  stump     2026-07-20_15:52:57   MoE 26.66 → dyn 26.58   -0.09
+
+  wins 6/7   mean Δ dyn−MoE ≈ +0.14 dB
+
+Recipe (train_dynamic_tree_moe_gnn.sh):
+  branch=4, grow_factor=2, max_leaves=10, max_total_grows=3 (v1) / 2 (v1.1)
+  heads/event=1, lagging-head boost, min_neff=1.2, near-miss 0.98
+  dual GNN at root + internals, warm-start from flat MoE
+  grow_start=8k, stop=20k (v1) / 16k (v1.1), gamma=0.5 (v1) / 0.25 (v1.1)
+
+Archived failed start-8 / root-no-GNN sweeps:
+  outputs/mipnerf360/_archived_fullwin2/
+================================================================================

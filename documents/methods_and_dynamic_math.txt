@@ -1,0 +1,398 @@
+================================================================================
+ FOUR METHODS + DETAILED MATH: DYNAMIC BEAT-FLAT TREE MoE+GNN
+================================================================================
+
+Kept methods only:
+  1) baseline              train_baseline.sh
+  2) flat MoE              train_moe.sh
+  3) MoE+GNN               train_moe_gnn.sh
+  4) dynamic beat-flat     train_dynamic_tree_moe_gnn.sh
+
+Kitchen @ 30k (representative):
+  baseline                 PSNR 31.26
+  MoE+GNN                  PSNR 31.70
+  flat MoE (8)             PSNR 31.81
+  dynamic beat-flat        PSNR 32.09   (+0.28 vs flat MoE)
+
+
+================================================================================
+ 0. SHARED SCAFFOLD-GS BACKBONE
+================================================================================
+
+Scene is voxelized into N anchors. Anchor i has:
+  x_i in R^3          position
+  f_i in R^C          learnable feature  (f_v), C = feat_dim
+  offsets / scaling   spawn k neural Gaussians per anchor
+
+For a camera with center c, view properties:
+  d_i = || x_i - c ||
+  v_i = (x_i - c) / d_i
+
+Expert / MLP input (view-conditioned, raw f_v — never GNN-enriched):
+  u_i = [ f_i  ||  v_i  ||  d_i (optional)  ||  appearance (optional) ]
+
+Attribute heads predict opacity / covariance / color for the k offsets.
+Rasterize → image I_hat; supervise with L1 + DSSIM (+ MoE regularizers).
+
+
+================================================================================
+ 1. BASELINE  (Scaffold-GS)
+================================================================================
+
+One shared 2-layer MLP per attribute:
+  y_i = MLP(u_i)
+
+No experts, no router, no GNN.
+Equivalent to MoE with E = 1.
+
+
+================================================================================
+ 2. FLAT MoE  (Scene Experts style)
+================================================================================
+
+E experts {Expert_e}_{e=1..E}, each same size as baseline MLP.
+Point-wise router:
+  z_i = W_r f_i + b_r            in R^E
+  g_i = softmax(z_i)             in R^E
+
+Dense warmup, then sparse Top-k:
+  Let T_i = TopK indices of g_i.
+  w_{i,e} = g_{i,e} / sum_{e' in T_i} g_{i,e'}    if e in T_i, else 0
+
+Output:
+  y_i = sum_e w_{i,e} Expert_e(u_i)
+
+Loss extras (typical):
+  L_load   = E * sum_e P_e f_e     (Switch-style load balance)
+  L_ent    = - mean_i sum_e g_{i,e} log g_{i,e}   (concentrate after warmup)
+
+Kitchen default: E=8, Top-2.
+
+
+================================================================================
+ 3. MoE+GNN  (flat MoE + dual router)
+================================================================================
+
+Build an anchor graph G = (V,E_graph):
+  nodes = visible anchors
+  edges = spatial k-NN on positions x  (k=16), cached, no_grad
+
+Neighbor attention (one GNN layer), for j in N(i):
+  score_ij = (W_q h_i · W_k h_j) / sqrt(d_attn)  +  w_d * ||x_i - x_j||
+  alpha_ij = softmax_{j in N(i)}(score_ij)
+  m_i      = sum_j alpha_ij h_j
+  h_i      <- h_i + U( ReLU( M[ h_i || m_i ] ) )
+
+Stack L=2 layers; H^{(0)} = F = {f_i}; output h_gnn,i = H^{(L)}_i
+
+Dual router (same experts as flat MoE; experts still see raw u_i):
+  z_base,i = W_A f_i
+  z_gnn,i  = W_B [ f_i || h_gnn,i ]
+  z_i      = z_base,i + gamma * z_gnn,i
+  g_i      = softmax(z_i) → Top-k → mix experts
+
+gamma is a learnable scalar (init 0.5).
+
+Interpretation: spatial neighborhood context changes WHICH experts fire;
+each expert still decodes from the same view-conditioned raw feature.
+
+
+================================================================================
+ 4. DYNAMIC BEAT-FLAT TREE MoE+GNN   (detailed math)
+================================================================================
+
+Goal: adaptive capacity — hard / heterogeneous regions get deeper expert
+subtrees; easy regions keep few leaves — while staying near flat MoE scale
+(~8 leaves), plus GNN dual routing.
+
+
+--------------------------------------------------------------------------------
+ 4.1 Tree structure
+--------------------------------------------------------------------------------
+
+Each attribute head (opacity / cov / color) has its own tree.
+
+Initial tree (beat-flat defaults):
+  Root internal node with B0 = 4 leaf experts
+      root
+     / | \ \
+   L0 L1 L2 L3
+
+grow_factor B_g = 2:
+  When a leaf is grown, replace it by an internal DualRouter + 2 children
+  cloned from the parent expert (+ small noise).
+
+Example after growing L1:
+      root
+     / |  \ \
+   L0 R1  L2 L3
+      / \
+   L1a L1b
+
+Leaf count change for one grow:
+  L  <-  L - 1 + B_g     (with B_g=2:  L <- L + 1)
+
+Caps (beat-flat):
+  max_leaves = 10
+  max_total_grows = 4 per attribute head
+  max_depth = 3
+
+Kitchen winning run ended near:
+  opacity leaves = 8,  cov = 4,  color = 8
+
+
+--------------------------------------------------------------------------------
+ 4.2 Hierarchical dual routing
+--------------------------------------------------------------------------------
+
+At EVERY internal node n, DualRouter over its children C(n):
+
+  z_base,i^(n) = W_A^(n) f_i
+  z_gnn,i^(n)  = W_B^(n) [ f_i || h_gnn,i ]
+  z_i^(n)      = z_base,i^(n) + gamma^(n) * z_gnn,i^(n)
+
+  pi_i^(n)(c)  = softmax_c ( z_i^(n) )_c     for c in C(n)
+
+Sparse (after warmup / outside dense window): keep Top-k children, renormalize.
+
+Path probability of reaching a leaf ell from the root:
+
+  p_i(ell) = product_{(n -> c) on path(root,ell)}  pi_i^(n)(c)
+
+Forward (soft mixture along the tree):
+  Let y_i^(ell) = Expert_ell(u_i)
+  y_i = sum_ell  p_i(ell)  y_i^(ell)
+
+Equivalently, recurse: at internal n,
+  y_i^(n) = sum_{c in C(n)} pi_i^(n)(c) * y_i^(c)
+  with y_i^(leaf) = Expert(u_i).
+
+IMPORTANT: experts ALWAYS take u_i (raw f_v + view). h_gnn only enters routers.
+
+
+--------------------------------------------------------------------------------
+ 4.3 Why this can beat flat MoE
+--------------------------------------------------------------------------------
+
+Flat MoE: fixed E=8 experts, each with equal parameter budget, one flat router.
+
+Dynamic tree:
+  (1) Adaptive capacity
+      Easy regions stay at depth-1 leaves (few params).
+      Hard regions get binary splits → more specialists on that subset.
+  (2) Hierarchical routing
+      Coarse choice at root, fine choice deeper — lower routing entropy cost
+      than a flat 16-way router, while still expanding capacity locally.
+  (3) GNN dual router
+      Same spatial context advantage as MoE+GNN at every internal node.
+  (4) Warm-start from flat MoE
+      Leaf experts initialized from the best flat MoE experts → start near
+      the flat MoE optimum, then grow only where needed.
+  (5) Anti-overgrowth (beat-flat policy)
+      Force-growing to 16 created many near-zero path-prob leaves and hurt
+      test PSNR. Caps + selective score keep L ≈ 8 active specialists.
+
+
+--------------------------------------------------------------------------------
+ 4.4 Growth statistics (per training step)
+--------------------------------------------------------------------------------
+
+After a forward, leaf path probs p_i(ell) are available for visible anchors i.
+
+For each leaf ell, accumulate over a growth window:
+
+  mass_ell     +=  sum_i p_i(ell)
+
+  loss_mass_ell += (sum_i p_i(ell)) * L1(I_hat, I)     # scalar image L1
+
+  For feature heterogeneity, weighted variance of f_i under p_i(ell):
+    mu_ell     = (sum_i p_i(ell) f_i) / (sum_i p_i(ell) + eps)
+    var_ell    = (sum_i p_i(ell) ||f_i - mu_ell||^2 / C) / (sum_i p_i(ell) + eps)
+    feat_m2_ell += var_ell
+
+At growth time, with totals over the window:
+
+  mass_frac_ell = mass_ell / sum_{ell'} mass_ell'
+
+  L_ell         = loss_mass_ell / mass_ell
+                  (weak alone — same image L1 — but harmless as a multiplier)
+
+  feat_var_ell  = feat_m2_ell / (#steps leaf was updated)
+
+
+--------------------------------------------------------------------------------
+ 4.5 Growth score (information / difficulty proxy)  — v2
+--------------------------------------------------------------------------------
+
+  S_ell = mass_frac_ell * (1 + 1.5 * feat_var_ell) * (1 + L_ell / median_{ell'}(L) )
+
+  neff_ell = 1 + feat_var_ell / median_{ell'}(feat_var)   # diversity proxy
+
+Interpretation:
+  mass_frac   — traffic share (busy leaves need capacity; PI: unequal difficulty)
+  feat_var    — residual / feature heterogeneity (up-weighted 1.5x in v2 so
+                heterogeneous leaves beat pure-mass candidates)
+  L / median  — mild difficulty weight
+  neff        — relative feature diversity; gate with min_neff (bypass if lagging head)
+
+Ideal information-gain view of a split (not computed exactly, but motivating):
+
+  IG(ell) = H(Y|ell) - sum_{c=1}^{B_g} p(c|ell) H(Y|ell,c)
+
+High feat_var ≈ high H(Y|ell); growing aims to reduce conditional uncertainty.
+
+
+--------------------------------------------------------------------------------
+ 4.6 When a leaf is grown (beat-flat policy v2)
+--------------------------------------------------------------------------------
+
+At iterations t = t0, t0+Delta, ... while t <= t_stop
+  (defaults: t0=8000, Delta=4000, t_stop=20000)
+
+Among growable leaves (depth < max_depth, L + B_g - 1 <= max_leaves,
+grows_so_far < max_total_grows):
+
+  thr     = median(S) * rho          (rho = 1.15)
+  thr_eff = thr * 0.98               # near-miss tolerance (v2)
+
+Select candidates with:
+  mass_frac_ell >= m_min             (m_min = 0.15, or 0.75*m_min if lagging head)
+  AND (neff_ell >= min_neff OR bypass_neff)   (min_neff=1.0; bypass if lagging)
+  AND ( S_ell >= thr_eff  OR  mass_frac_ell >= max(0.30, m_min) )
+
+Lagging-head boost: before growing, compare leaf counts across
+opacity / cov / color. If a head has leaves <= max_other - 1:
+  rho_eff  = rho * 0.92
+  m_min_eff = m_min * 0.75
+  bypass_neff = True
+so under-grown heads (e.g. garden cov, stump color) can catch up.
+
+Cross-head budget (single recipe): rank candidate heads by
+  (lagging_first, score) and grow at most
+  tree_grow_max_heads_per_event heads (default 1).
+This stops outdoor runs from growing opacity+cov+color every event
+(over-fragmentation on stump).
+
+The OR avoids the 1-busy-leaf trap where median(S)=S_top so S >= rho*S never holds.
+Near-miss (0.98) avoids float edge skips (e.g. 0.8225 vs thr 0.8226).
+
+Grow at most 1 leaf per chosen head per event (max_grows=1).
+force_grow = False  (no automatic fill to max_leaves).
+
+On grow of leaf ell:
+  1. Create DualRouter with B_g children
+  2. Clone Expert_ell → children + N(0, sigma^2) noise
+  3. Replace ell in the parent ModuleList
+  4. Refresh Adam: keep state for surviving params; new params start fresh
+  5. Dense routing for T_dense iters (default 1500), capped so
+       dense_until = min(t + T_dense, iterations - 3000)
+       → always >=3k sparse fine-tune before final eval
+  6. Reset leaf stats for the next window
+
+No grows after t_stop (default 20000).
+
+
+--------------------------------------------------------------------------------
+ 4.7 Training losses (same family as flat MoE)
+--------------------------------------------------------------------------------
+
+  L = (1-lambda_dssim) L1 + lambda_dssim (1-SSIM) + 0.01 * scaling_reg
+      + lambda_opacity * opacity_reg
+      + lambda_load    * L_load_tree
+      + lambda_ent     * L_ent_tree     (after warmup)
+
+Tree load balance: average Switch-style load over ALL internal routers:
+  For each internal n with gates pi^(n):
+    L_load^(n) = |C(n)| * sum_c mean_i(pi_i^(n)(c))^2
+  L_load_tree = mean_n L_load^(n)
+
+Tree entropy: entropy of leaf path distribution p_i(ell), averaged over i.
+
+
+--------------------------------------------------------------------------------
+ 4.8 End-to-end forward (one view)
+--------------------------------------------------------------------------------
+
+  1. Frustum-cull anchors → F, X
+  2. AnchorGNN(X, F) → h_gnn
+  3. Build u_i = [f_i || view || ...]
+  4. For each attribute TreeMoE:
+       hierarchical dual-route → mix leaf Expert(u_i)
+  5. Opacity mask; spawn offsets → neural Gaussians → rasterize
+  6. Backprop into experts, all DualRouters, gammas, GNN, f_v
+     (NOT into k-NN edge selection)
+
+
+--------------------------------------------------------------------------------
+ 4.9 Beat-flat hyperparameters (fullwinv1 / v1.1)
+--------------------------------------------------------------------------------
+
+  moe_branch_factor      = 4
+  moe_grow_factor        = 2
+  moe_tree_depth        = 3
+  moe_max_leaves        = 10
+  moe_max_total_grows   = 3      # v1.1: 2
+  moe_top_k             = 2
+  moe_warmup            = 3000
+  use_gnn               = True
+  gnn_gamma_init        = 0.5    # v1.1: 0.25 (stump-safer)
+  tree_grow_start       = 8000
+  tree_grow_interval    = 4000
+  tree_grow_stop        = 20000  # v1.1: 16000
+  tree_grow_max_heads_per_event = 1
+  tree_grow_min_score_ratio = 1.15
+  tree_grow_min_mass_frac   = 0.15
+  tree_grow_min_neff        = 1.2
+  tree_grow_force       = False
+  tree_grow_dense_iters = 1500
+  warm-start            = flat MoE checkpoints.pth (cycle onto leaves)
+  lagging-head boost    = ratio*0.92, mass*0.75, bypass_neff
+  near-miss             = S >= thr * 0.98
+  feat_var weight       = 1.5 in S
+
+  Canonical Mip360 table: documents/fullwinv1_results.txt (6/7 vs flat MoE).
+  Note: Dynamic always includes MoE+GNN (dual root router + AnchorGNN every step).
+  Do not disable GNN for Dynamic; compare primarily vs MoE+GNN and MoE.
+
+
+================================================================================
+ 5. HOW TO RUN (only these four)
+================================================================================
+
+  Single scene:
+    bash train_baseline.sh              -d mipnerf360/kitchen -g 0
+    bash train_moe.sh                   -d mipnerf360/kitchen -g 0
+    bash train_moe_gnn.sh               -d mipnerf360/kitchen -g 0
+    bash train_dynamic_tree_moe_gnn.sh  -d mipnerf360/kitchen -g 0
+
+  Sweep all 4 methods over dataset suites:
+    bash sweep_four_methods.sh --suite mip360 -g 0
+    bash sweep_four_methods.sh --suite tandt,db -g 0
+    bash sweep_four_methods.sh --suite all -g 0
+    bash sweep_four_methods.sh --suite quick -g 0          # kitchen,truck,playroom,lego
+    bash sweep_four_methods.sh --scenes mipnerf360/kitchen,tandt/truck -g 0
+    bash sweep_four_methods.sh --suite mip360 --skip-done -g 0
+    bash sweep_four_methods.sh --suite mip360 --dry-run -g 0
+
+  Suites: mip360 | tandt | db | bungee | nerf | all | quick
+  Per-scene order: baseline → moe → moe_gnn → dynamic (warm-starts from that scene's moe)
+  Logs: sweep_logs/sweep_<timestamp>.log
+  Summary PSNR table: sweep_logs/summary_<timestamp>.txt
+
+Outputs:
+  outputs/<data>/baseline/<timestamp>/
+  outputs/<data>/moe/<timestamp>/
+  outputs/<data>/moe_gnn/<timestamp>/
+  outputs/<data>/dynamic_tree_moe_gnn/<timestamp>/
+
+
+================================================================================
+ 6. CODE MAP
+================================================================================
+
+  scene/moe.py              flat AttributeMoE (+ dual router if use_gnn)
+  scene/gnn.py              AnchorGNN / NeighborAttention
+  scene/tree_moe.py         AttributeTreeMoE, DualRouter, growth score
+  scene/gaussian_model.py   wiring, grow, optimizer refresh
+  scene/moe_utils.py        warm-start flat MoE → tree leaves
+  train.py                  curriculum, leaf stats, grow, dense window
