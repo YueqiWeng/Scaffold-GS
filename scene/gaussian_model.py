@@ -108,6 +108,7 @@ class GaussianModel:
             max(self.moe_branch_factor, self.moe_grow_factor) if self.use_tree_moe else self.num_experts,
         )
 
+        # GNN allowed for flat MoE+GNN (moe_gnn) and legacy dynamic_tree checkpoints.
         self.use_gnn = bool(use_gnn)
         self.gnn_hidden_dim = gnn_hidden_dim
         self.gnn_layers = gnn_layers
@@ -154,8 +155,6 @@ class GaussianModel:
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
         self.color_dist_dim = 1 if self.add_color_dist else 0
 
-        # Attribute MoE / TreeMoE (num_experts==1 or single leaf ≈ shared MLP).
-        # With use_gnn: dual router (base + GNN), experts still see raw fv.
         if self.use_tree_moe:
             tree_kw = dict(
                 branch_factor=self.moe_branch_factor,
@@ -263,6 +262,50 @@ class GaussianModel:
             return None
         return self.anchor_gnn(anchor_pos, anchor_feat)
 
+    def moe_routing_snapshot(self):
+        """Per-head gate stats for routing_analysis.json (works for 1 expert too)."""
+        heads = {}
+        for name, moe in (
+            ("opacity", self.mlp_opacity),
+            ("cov", self.mlp_cov),
+            ("color", self.mlp_color),
+        ):
+            n = int(getattr(moe, "num_experts", 1))
+            rec = {"n_experts": n}
+            gates = getattr(moe, "_last_gates", None)
+            selected = getattr(moe, "_last_selected", None)
+            if gates is not None and gates.numel() > 0:
+                util = gates.detach().float().mean(dim=0).cpu()
+                rec["util"] = [float(x) for x in util]
+                p = util.clamp_min(1e-8)
+                p = p / p.sum()
+                h = float(-(p * p.log()).sum())
+                rec["util_entropy"] = h
+                rec["util_entropy_norm"] = h / max(float(np.log(max(n, 1))), 1e-8)
+                mean_u = float(util.mean().clamp_min(1e-8))
+                rec["cv"] = float(util.std(unbiased=False) / mean_u) if n > 1 else 0.0
+                rec["max_util"] = float(util.max())
+                rec["min_util"] = float(util.min())
+                g = gates.detach().float().clamp_min(1e-8)
+                rec["sample_entropy"] = float(-(g * g.log()).sum(dim=-1).mean())
+                if selected is not None:
+                    rec["select_frac"] = [
+                        float(x) for x in selected.detach().float().mean(dim=0).cpu()
+                    ]
+            if hasattr(moe, "describe"):
+                rec["tree"] = moe.describe()
+            hist = getattr(moe, "_growth_history", None)
+            if hist is not None:
+                rec["growth_history"] = list(hist)
+            heads[name] = rec
+        return {
+            "arch": getattr(self, "moe_arch", "flat"),
+            "use_moe": bool(getattr(self, "use_moe", False)),
+            "use_gnn": bool(getattr(self, "use_gnn", False)),
+            "sparse": bool(getattr(self.mlp_opacity, "sparse", False)),
+            "heads": heads,
+        }
+
     def moe_expert_utilization(self):
         """Mean gate per expert/leaf, averaged over opacity/cov/color MoEs."""
         if not self.use_moe:
@@ -361,13 +404,10 @@ class GaussianModel:
 
     def maybe_grow_tree_moe(self, training_args, logger=None):
         """
-        Grow high-need leaves with a cross-head budget (single dynamic recipe).
+        Grow high-need leaves.
 
-        - Lagging heads (leaves <= max_other - 1) get relaxed score/mass and
-          bypass min_neff so one head does not stay stuck at 4 leaves.
-        - At most `tree_grow_max_heads_per_event` heads grow per event (default 1),
-          ranked by (lagging first, then score). Prevents outdoor over-fragmentation
-          when all three heads would otherwise grow every 4k iters.
+        Prefer color when it lags (appearance is usually hardest). Looser
+        loss/mass gates for lagging heads so growth is not stuck on opacity/cov.
         """
         if not self.use_tree_moe or self.moe_arch != "dynamic_tree":
             return []
@@ -384,25 +424,42 @@ class GaussianModel:
 
         leaf_counts = [moe.num_experts for _, moe in heads]
         max_leaves = max(leaf_counts)
-        base_ratio = float(getattr(training_args, "tree_grow_min_score_ratio", 1.15))
-        base_mass = float(getattr(training_args, "tree_grow_min_mass_frac", 0.15))
-        base_neff = float(getattr(training_args, "tree_grow_min_neff", 1.2))
+        min_leaves = min(leaf_counts)
+        base_ratio = float(getattr(training_args, "tree_grow_min_score_ratio", 1.08))
+        base_mass = float(getattr(training_args, "tree_grow_min_mass_frac", 0.12))
+        base_neff = float(getattr(training_args, "tree_grow_min_neff", 1.1))
+        base_loss = float(getattr(training_args, "tree_grow_min_loss_ratio", 0.95))
+        hetero_easy = float(getattr(training_args, "tree_grow_hetero_easy", 1.0))
+        hetero_hard = float(getattr(training_args, "tree_grow_hetero_hard", 1.0))
+        require_fv = bool(getattr(training_args, "tree_grow_require_feat_var_median", False))
         max_grows = int(getattr(training_args, "tree_grow_max_per_event", 1))
-        max_heads = int(getattr(training_args, "tree_grow_max_heads_per_event", 1))
+        max_heads = int(getattr(training_args, "tree_grow_max_heads_per_event", 2))
         force_grow = bool(getattr(training_args, "tree_grow_force", False))
+        # Color first, then opacity, then cov.
+        head_priority = {"color": 3, "opacity": 2, "cov": 1}
 
-        proposals = []  # (lagging_rank, score, name, moe, lid, dbg, ratio, mass, lagging)
+        proposals = []
         debug_msgs = []
         for name, moe in heads:
             lagging = moe.num_experts <= (max_leaves - 1)
-            min_score_ratio = base_ratio * (0.92 if lagging else 1.0)
-            min_mass_frac = base_mass * (0.75 if lagging else 1.0)
+            # Extra boost when this head is the smallest (often color never grew).
+            starved = moe.num_experts == min_leaves and max_leaves > min_leaves
+            color_boost = name == "color" and (lagging or starved)
+            min_score_ratio = base_ratio * (0.88 if color_boost else (0.92 if lagging else 1.0))
+            min_mass_frac = base_mass * (0.65 if color_boost else (0.75 if lagging else 1.0))
+            min_loss_ratio = base_loss * (0.90 if color_boost else (0.95 if lagging else 1.0))
+            # Force at least one candidate if color is starved and others already grew.
+            head_force = force_grow or (color_boost and starved and max_leaves >= min_leaves + 1)
             cands = moe.select_grow_candidates(
                 min_score_ratio=min_score_ratio,
                 min_neff=base_neff,
-                force_grow=force_grow,
+                force_grow=head_force,
                 min_mass_frac=min_mass_frac,
-                bypass_neff=lagging,
+                bypass_neff=lagging or color_boost,
+                min_loss_ratio=min_loss_ratio,
+                hetero_easy=hetero_easy,
+                hetero_hard=hetero_hard,
+                require_feat_var_median=require_fv,
             )
             dbg = getattr(moe, "_last_grow_debug", "")
             tag = "lag" if lagging else "ok"
@@ -411,9 +468,18 @@ class GaussianModel:
             )
             if cands:
                 sc, lid = cands[0]
-                # Prefer lagging heads, then highest score.
                 proposals.append(
-                    (1 if lagging else 0, sc, name, moe, lid, min_score_ratio, min_mass_frac)
+                    (
+                        1 if lagging else 0,
+                        head_priority.get(name, 0),
+                        sc,
+                        name,
+                        moe,
+                        lid,
+                        min_score_ratio,
+                        min_mass_frac,
+                        min_loss_ratio,
+                    )
                 )
 
         if debug_msgs:
@@ -428,11 +494,10 @@ class GaussianModel:
         proposals.sort(reverse=True)
         chosen = proposals[: max(1, max_heads)]
         all_grown = []
-        for _, sc, name, moe, lid, _, _ in chosen:
+        for _lag, _prio, sc, name, moe, lid, _, _, min_loss_ratio in chosen:
             if moe.grow_leaf(lid):
                 moe.reset_leaf_stats()
                 all_grown.append(f"{name}:{lid}")
-            # Extra leaf grows on the same head if max_grows > 1
             for _extra in range(max_grows - 1):
                 more = moe.select_grow_candidates(
                     min_score_ratio=base_ratio,
@@ -440,13 +505,16 @@ class GaussianModel:
                     force_grow=False,
                     min_mass_frac=base_mass,
                     bypass_neff=False,
+                    min_loss_ratio=min_loss_ratio,
+                    hetero_easy=hetero_easy,
+                    hetero_hard=hetero_hard,
+                    require_feat_var_median=require_fv,
                 )
                 if not more:
                     break
                 if moe.grow_leaf(more[0][1]):
                     moe.reset_leaf_stats()
                     all_grown.append(f"{name}:{more[0][1]}")
-
         if all_grown:
             self.refresh_mlp_optimizer_params(training_args)
             msg = (

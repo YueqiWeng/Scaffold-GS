@@ -52,32 +52,99 @@ def _zero_routers(moe):
         nn.init.zeros_(moe.gnn_router.bias)
 
 
+def _spread_expert_indices(n_flat: int, n_leaves: int):
+    """
+    Map flat E experts onto L tree leaves with spread indices.
+
+    E=8, L=2 → [0, 4]; E=8, L=4 → [0, 2, 4, 6]; E==L → range(E).
+    """
+    if n_leaves <= 0:
+        return []
+    if n_flat <= 0:
+        return list(range(n_leaves))
+    if n_leaves == 1:
+        return [0]
+    if n_flat == n_leaves:
+        return list(range(n_flat))
+    # Contiguous-group starts: E=8,L=2 → [0,4]; E=8,L=4 → [0,2,4,6].
+    return [min(n_flat - 1, int(i * n_flat / n_leaves)) for i in range(n_leaves)]
+
+
+def _copy_flat_router_into_flat(moe, state_dict: dict) -> bool:
+    """
+    Copy flat MoE base router 1:1 into AttributeMoE; zero-init gnn_router if present.
+    """
+    if isinstance(moe, AttributeTreeMoE) or not hasattr(moe, "router"):
+        return False
+    n_exp = int(getattr(moe, "num_experts", 0))
+    for prefix in ("router.", "base_router."):
+        w_key, b_key = f"{prefix}weight", f"{prefix}bias"
+        if w_key not in state_dict or b_key not in state_dict:
+            continue
+        flat_w, flat_b = state_dict[w_key], state_dict[b_key]
+        if flat_w.ndim != 2 or flat_w.shape[0] != n_exp:
+            continue
+        with torch.no_grad():
+            moe.router.weight.copy_(flat_w)
+            moe.router.bias.copy_(flat_b)
+            if getattr(moe, "gnn_router", None) is not None:
+                nn.init.zeros_(moe.gnn_router.weight)
+                nn.init.zeros_(moe.gnn_router.bias)
+            print(
+                f"[MoE] Copied flat router → flat MoE "
+                f"(E={n_exp}, prefix={prefix[:-1]}; gnn_router zero-init)"
+            )
+            return True
+    return False
+
+
 def _copy_flat_router_into_tree_root(moe: AttributeTreeMoE, state_dict: dict) -> bool:
     """
-    When tree starts with E root leaves and checkpoint is flat MoE with E experts,
-    copy the flat base router into the root DualRouter so warm-start matches MoE routing.
-    GNN router stays zero; gamma left as initialized (typically small).
+    Copy / pool flat MoE router into the tree root DualRouter.
+
+    - If E == L: copy router columns 1:1.
+    - If E > L and E % L == 0: sum contiguous groups of size E/L (preserve prior).
+    - Else: fail (caller zeros routers).
     """
     if not isinstance(moe, AttributeTreeMoE):
         return False
     root = moe.root
     if root is None or root.is_leaf or root.router is None:
         return False
-    if len(root.child_nodes) != len(_collect_expert_state_dicts(state_dict)):
+    n_leaves = len(root.child_nodes)
+    n_flat = len(_collect_expert_state_dicts(state_dict))
+    if n_flat <= 0 or n_leaves <= 0:
         return False
-    # Flat AttributeMoE keys: router.weight / router.bias  (or base_router.*)
+
     for prefix in ("router.", "base_router."):
         w_key, b_key = f"{prefix}weight", f"{prefix}bias"
-        if w_key in state_dict and b_key in state_dict:
-            with torch.no_grad():
-                root.router.router.weight.copy_(state_dict[w_key])
-                root.router.router.bias.copy_(state_dict[b_key])
-                if root.router.gnn_router is not None:
-                    nn.init.zeros_(root.router.gnn_router.weight)
-                    nn.init.zeros_(root.router.gnn_router.bias)
+        if w_key not in state_dict or b_key not in state_dict:
+            continue
+        flat_w = state_dict[w_key]
+        flat_b = state_dict[b_key]
+        if flat_w.ndim != 2 or flat_w.shape[0] != n_flat:
+            continue
+        with torch.no_grad():
+            if n_flat == n_leaves:
+                root.router.router.weight.copy_(flat_w)
+                root.router.router.bias.copy_(flat_b)
+                mode = "1:1"
+            elif n_flat % n_leaves == 0:
+                group = n_flat // n_leaves
+                # Pool contiguous expert logits: [E, D] → [L, D]
+                w = flat_w.reshape(n_leaves, group, -1).sum(dim=1)
+                b = flat_b.reshape(n_leaves, group).sum(dim=1)
+                root.router.router.weight.copy_(w)
+                root.router.router.bias.copy_(b)
+                mode = f"pool/{group}"
+            else:
+                continue
+            if root.router.gnn_router is not None:
+                nn.init.zeros_(root.router.gnn_router.weight)
+                nn.init.zeros_(root.router.gnn_router.bias)
             print(
                 f"[MoE] Copied flat router → tree root "
-                f"({len(root.child_nodes)} leaves, prefix={prefix[:-1]})"
+                f"({n_flat}→{n_leaves} leaves, {mode}, prefix={prefix[:-1]})"
             )
             return True
     return False
@@ -87,17 +154,26 @@ def load_sequential_into_moe(moe, state_dict: dict):
     """
     Copy baseline Sequential or flat-MoE expert weights into leaf experts.
 
-    Flat MoE with E experts → assign onto tree leaves (1:1 when counts match).
-    If tree root has E children matching flat E, also copy flat router → root DualRouter.
-    Otherwise routers are zero-initialized.
+    Flat MoE with E experts → assign onto L tree leaves with spread indices
+    (E=8,L=2 → experts 0 and 4). Pool flat router into root when possible;
+    otherwise zero-init routers.
     """
     leaves = _iter_leaf_experts(moe)
     expert_sds = _collect_expert_state_dicts(state_dict)
 
     if expert_sds:
+        idxs = _spread_expert_indices(len(expert_sds), len(leaves))
         for j, expert in enumerate(leaves):
-            expert.load_state_dict(expert_sds[j % len(expert_sds)])
-        if not _copy_flat_router_into_tree_root(moe, state_dict):
+            expert.load_state_dict(expert_sds[idxs[j]])
+        if idxs != list(range(len(leaves))) or len(expert_sds) != len(leaves):
+            print(
+                f"[MoE] Warm-start experts spread {len(expert_sds)}→{len(leaves)} "
+                f"via indices {idxs}"
+            )
+        if isinstance(moe, AttributeTreeMoE):
+            if not _copy_flat_router_into_tree_root(moe, state_dict):
+                _zero_routers(moe)
+        elif not _copy_flat_router_into_flat(moe, state_dict):
             _zero_routers(moe)
         return
 

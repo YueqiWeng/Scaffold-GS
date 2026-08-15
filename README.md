@@ -111,44 +111,24 @@ For custom data, you should process the image sequences with [Colmap](https://co
 
 ## Training
 
-### Training multiple scenes
+```bash
+# Single scene
+bash train_method.sh --method baseline -d mipnerf360/kitchen -g 0
+bash train_method.sh --method moe      -d mipnerf360/kitchen -g 0
+bash train_method.sh --method moe_gnn  -d mipnerf360/kitchen -g 0   # needs moe
+bash train_method.sh --method moe_tree -d mipnerf360/kitchen -g 0   # needs moe
+bash train_method.sh --method tree_gnn -d mipnerf360/kitchen -g 0   # needs moe
 
-To train multiple scenes in parallel, we provide batch training scripts: 
-
- - Tanks&Temples: ```train_tnt.sh```
- - MipNeRF360: ```train_mip360.sh```
- - BungeeNeRF: ```train_bungee.sh```
- - Deep Blending: ```train_db.sh```
- - Nerf Synthetic: base ->```train_nerfsynthetic.sh```; with warmup->```train_nerfsynthetic_withwarmup.sh```
-
- run them with 
-
- ```
-bash train_xxx.sh
- ```
-
- > Notice 1: Make sure you have enough GPU cards and memories to run these scenes at the same time.
-
- > Notice 2: Each process occupies many cpu cores, which may slow down the training process. Set ```torch.set_num_threads(32)``` accordingly in the ```train.py``` to alleviate it.
-
-### Training a single scene
-
-For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
-
-```
-bash ./single_train.sh
+# Full suite (skip finished runs)
+bash sweep.sh --suite mip360 --skip-done -g 0
+bash sweep.sh --suite mip360 --methods moe,moe_tree,moe_gnn,tree_gnn -g 0
 ```
 
-- scene: scene name with a format of ```dataset_name/scene_name/``` or ```scene_name/```;
-- exp_name: user-defined experiment name;
-- gpu: specify the GPU id to run the code. '-1' denotes using the most idle GPU. 
-- voxel_size: size for voxelizing the SfM points, smaller value denotes finer structure and higher overhead, '0' means using the median of each point's 1-NN distance as the voxel size.
-- update_init_factor: initial resolution for growing new anchors. A larger one will start placing new anchor in a coarser resolution.
+- `-d`: `dataset_name/scene_name`
+- `-g`: GPU id
+- Methods: see `documents/method_names.md`
 
-> For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script. 
-
-
-This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
+Logs go to `outputs/<data>/<method>/<timestamp>/`.
 
 
 

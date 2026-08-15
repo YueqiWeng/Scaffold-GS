@@ -114,8 +114,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     gaussians.training_setup(opt)
     if dataset.start_baseline_mlp:
         load_baseline_checkpoints_into_model(gaussians, dataset.start_baseline_mlp)
-    # Optional explicit geometry warm-start (not auto). Dynamic default trains
-    # densify from SfM like MoE / MoE+GNN; GNN is always active via --use_gnn.
+    # Optional geometry warm-start (legacy). Canonical moe_gnn densifies
+    # from SfM (no ply) after MLP warm-start into flat MoE + dual GNN router.
     start_ply = getattr(dataset, "start_gaussian_ply", "") or ""
     if start_ply:
         if not os.path.isfile(start_ply):
@@ -144,6 +144,37 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         logger.info(f"[MoE] arch={gaussians.tree_moe_summary()}")
     elif gaussians.use_moe:
         print(f"[MoE] arch={gaussians.tree_moe_summary()}")
+
+    routing_log = []
+    routing_path = os.path.join(dataset.model_path, "routing_analysis.json")
+
+    def _flush_routing():
+        payload = {
+            "model_path": dataset.model_path,
+            "arch": getattr(gaussians, "moe_arch", "flat"),
+            "use_gnn": bool(getattr(gaussians, "use_gnn", False)),
+            "timeline": routing_log,
+        }
+        with open(routing_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _record_routing(iteration, event="tick"):
+        with torch.no_grad():
+            snap = gaussians.moe_routing_snapshot()
+        snap["iter"] = int(iteration)
+        snap["event"] = event
+        routing_log.append(snap)
+        if logger is not None:
+            heads = snap.get("heads", {})
+            bits = []
+            for hname in ("opacity", "cov", "color"):
+                h = heads.get(hname, {})
+                bits.append(
+                    f"{hname}[n={h.get('n_experts', '?')} H={h.get('sample_entropy', float('nan')):.3f} cv={h.get('cv', float('nan')):.3f}]"
+                )
+            logger.info(f"[Routing] iter={iteration} {event} " + " ".join(bits))
+        if iteration % 5000 == 0 or event != "tick":
+            _flush_routing()
 
     for iteration in range(first_iter, opt.iterations + 1):
         if gaussians.use_moe:
@@ -221,6 +252,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # Dynamic tree: accumulate leaf difficulty stats from this step's loss.
             gaussians.moe_record_leaf_stats(float(Ll1.detach().item()))
 
+        if iteration % 1000 == 0 or iteration == 1:
+            _record_routing(iteration, event="tick")
+
         if gaussians.use_moe and tb_writer and iteration % 1000 == 0:
             util = gaussians.moe_expert_utilization()
             if util is not None:
@@ -275,9 +309,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            # Dynamic tree MoE: periodically grow hard/high-traffic leaves.
-            # Growth-policy v2: freeze grows after tree_grow_stop; cap dense
-            # window so >=3k sparse fine-tune remains before final iter.
+            # Dynamic tree MoE (+ optional GNN): grow hard leaves after
+            # tree_grow_start; freeze after tree_grow_stop. Post-grow dense
+            # window leaves a sparse Top-k tail.
             grow_start = getattr(opt, "tree_grow_start", 8000)
             grow_every = getattr(opt, "tree_grow_interval", 4000)
             grow_stop = int(getattr(opt, "tree_grow_stop", 20000))
@@ -288,6 +322,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 and (iteration - grow_start) % grow_every == 0
             ):
                 grown = gaussians.maybe_grow_tree_moe(opt, logger=logger)
+                if grown:
+                    _record_routing(iteration, event="grow:" + ",".join(grown))
                 if tb_writer:
                     tb_writer.add_scalar(
                         f'{dataset_name}/tree_moe_leaves_opacity',
@@ -322,6 +358,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    _record_routing(opt.iterations, event="final")
+    _flush_routing()
+    if logger is not None:
+        logger.info(f"[Routing] wrote {routing_path} ({len(routing_log)} snapshots)")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

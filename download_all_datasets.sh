@@ -15,7 +15,7 @@ else
     unzip -qo downloads/tandt_db.zip -d data
     rm -f downloads/tandt_db.zip
 fi
-# train_db.sh expects blending/ but the zip extracts to db/
+# Deep Blending zip may extract as db/ (used as data/db/ in sweeps)
 ln -sfn db data/blending
 
 echo "=== [2/4] MipNeRF360 (~12 GB) ==="

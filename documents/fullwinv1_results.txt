@@ -14,7 +14,7 @@ Official dynamic stamps (after archiving fullwin2 start-8 runs):
 
   wins 6/7   mean Δ dyn−MoE ≈ +0.14 dB
 
-Recipe (train_dynamic_tree_moe_gnn.sh):
+Recipe (historical dynamic+GNN; method removed — see train_method.sh --method dynamic):
   branch=4, grow_factor=2, max_leaves=10, max_total_grows=3 (v1) / 2 (v1.1)
   heads/event=1, lagging-head boost, min_neff=1.2, near-miss 0.98
   dual GNN at root + internals, warm-start from flat MoE

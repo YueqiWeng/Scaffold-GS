@@ -1,0 +1,107 @@
+================================================================================
+  Combo figure:  A moe_gnn  |  B tree_gnn  |  C moe_tree
+================================================================================
+
+  PATH 1 (GNN dual-router) → Method A + Method B
+  PATH 2 (base_router only, NO GNN) → Method C only
+
+
+================================================================================
+ TWO ROUTER PATHS
+================================================================================
+
+  PATH 1 — WITH GNN                    PATH 2 — NO GNN
+  (moe_gnn, tree_gnn)                   (moe_tree only)
+  ---------------------------------     ---------------------------------
+
+       [ Anchor ]                            [ Anchor ]
+           |                                     |
+       position + f_v                           f_v
+           |                                     |
+           v                                     v
+        [ GNN ] --> h_gnn                 [ base_router(f_v) ]
+           |                                     |
+     .-----+-----.                               |
+     v           v                               |
+  [base_router] [gnn_router]                     |
+     |           |                               |
+     '--> + <----'  (gamma)                      |
+           |                                     |
+           v                                     v
+    Dual-Router Math                      router scores
+           |                                     |
+      .----+----.                                |
+      |         |                                |
+      v         v                                v
+   moe_gnn   tree_gnn                         moe_tree
+   (A)       (B)                              (C)
+
+
+================================================================================
+ THREE METHODS
+================================================================================
+
+ A: moe_gnn                 B: tree_gnn                   C: moe_tree
+ Flat MoE + GNN             Growing Tree + GNN            Growing Tree, NO GNN
+ from Dual-Router Math      from Dual-Router Math         from base_router only
+ -------------------------- ---------------------------   ---------------------------
+ [ Flat Root Router ]       [ Tree Root Router ]          [ Tree Root Router ]
+  (8 scores)                 start 8 leaves                start 8 leaves
+         |                           |                             |
+         v                           |                             |
+ [ Top-2 Selection ]                 |                             |
+         |                           |                             |
+         v                           v                             v
+  [E0] .... [E7]            after grow:                   after grow:
+  capacity fixed            [EA] [RouterB] [EC]           [EA] [RouterB] [EC]
+                                  /   \                         /   \
+                               [B1]   [B2]                   [B1]   [B2]
+                            color-first grow              color-first grow
+
+
+================================================================================
+ ASCII combo
+================================================================================
+
+  ============================          =========================
+   WITH GNN                             NO GNN
+   A moe_gnn + B tree_gnn               C moe_tree ONLY
+  ============================          =========================
+
+       [ Anchor ]                            [ Anchor ]
+           |                                     |
+       position                                 f_v
+           |                                     |
+           v                                     v
+        [ GNN ] -- h_gnn                  [ base_router ]
+           |          |                          |
+           |          v                          |
+           |   [gnn_router]                      |
+           |          |                          |
+           v          v                          |
+      [base_router]-->+ (gamma)                  |
+                      |                          |
+                      v                          |
+             Dual-Router Math                    |
+                 /        \                      |
+                v          v                     v
+         ============  ============       ============
+          A moe_gnn     B tree_gnn         C moe_tree
+          Flat+GNN       Tree+GNN          Tree, NO GNN
+         ============  ============       ============
+              |              |                   |
+              v              v                   v
+       [Flat Router]  [Tree Router]       [Tree Router]
+        Top-2 / E0-7   grow hard leaves    grow hard leaves
+                       (color-first)       (color-first)
+
+
+================================================================================
+ Differences
+================================================================================
+
+  A moe_gnn  : flat 8 + GNN dual-router. Never grows.
+  B tree_gnn : tree + GNN dual-router. Grows hard leaves.
+  C moe_tree : tree, NO GNN (base_router only). Same grow as B.
+
+  Same expert input u. Same three heads (opacity / cov / color).

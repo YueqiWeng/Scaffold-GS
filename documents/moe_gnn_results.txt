@@ -1,0 +1,25 @@
+================================================================================
+ MoE+GNN  =  MoE with GNN
+================================================================================
+
+Name:   MoE+GNN
+Script: train_method.sh --method moe_gnn
+Folder: outputs/<data>/moe_gnn/<timestamp>/
+
+What it is (one sentence):
+  Finished flat MoE → add dual GNN router, keep MoE point cloud, densify OFF,
+  train another 30k.
+
+That IS "MoE with GNN". Not a separate model family.
+
+Pipeline:
+  1) --method moe
+  2) --method moe_gnn   # loads moe MLPs + ply automatically
+
+Kitchen / stump gain-split (best arm):
+  kitchen  moe 31.865 → moe_gnn 32.101  (+0.24)
+  stump    moe 26.663 → moe_gnn 26.802  (+0.14)
+
+Removed:
+  moe_then_densify (densify only)
+  old moe_gnn that densified again (GNN+densify) — that lost to GNN-only

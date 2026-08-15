@@ -77,20 +77,20 @@ class ModelParams(ParamGroup):
         self.add_color_dist = False
 
         # MoE-GS (Scene Experts). num_experts=1 keeps original Scaffold-GS.
-        # train_moe*.sh default to 8 experts + Top-2 sparse routing.
+        # train_method.sh --method moe defaults to 8 experts + Top-2.
         self.num_experts = 1
         self.moe_top_k = 2
 
         # MoE architecture:
-        #   flat          — flat AttributeMoE (train_moe.sh / train_moe_gnn.sh)
-        #   dynamic_tree  — growing TreeMoE+GNN (train_dynamic_tree_moe_gnn.sh)
+        #   flat          — flat AttributeMoE
+        #   dynamic_tree  — growing TreeMoE (+GNN via --use_gnn)
         self.moe_arch = "flat"
-        self.moe_branch_factor = 4
-        self.moe_tree_depth = 2
-        self.moe_max_leaves = 10
+        self.moe_branch_factor = 8
+        self.moe_tree_depth = 3
+        self.moe_max_leaves = 14
         # grow_factor: children spawned per split (0 => same as branch_factor).
-        self.moe_grow_factor = 0
-        self.moe_max_total_grows = 64
+        self.moe_grow_factor = 2
+        self.moe_max_total_grows = 4
 
         # MoE+GNN dual-router: AnchorGNN spatial context → GNN router logits
         # fused as z = z_base + γ * z_gnn (experts still use raw fv).
@@ -194,16 +194,20 @@ class OptimizationParams(ParamGroup):
         self.gnn_lr_delay_mult = 0.01
         self.gnn_lr_max_steps = 30_000
 
-        # Dynamic tree MoE growth (fullwinv1.1):
-        # start 4; selective; lagging-head; cross-head budget 1; freeze @16k.
-        self.tree_grow_start = 8000
+        # Dynamic v1/v2 growth (fullwin): start 4, selective grow, freeze @20k.
+        # hetero_easy=hard=1.0 disables scene budget (always allow up to max grows).
+        self.tree_grow_start = 6000
         self.tree_grow_interval = 4000
-        self.tree_grow_stop = 16000
+        self.tree_grow_stop = 20000
         self.tree_grow_max_per_event = 1
-        self.tree_grow_max_heads_per_event = 1
-        self.tree_grow_min_score_ratio = 1.15
-        self.tree_grow_min_neff = 1.2
-        self.tree_grow_min_mass_frac = 0.15
+        self.tree_grow_max_heads_per_event = 2
+        self.tree_grow_min_score_ratio = 1.08
+        self.tree_grow_min_neff = 1.1
+        self.tree_grow_min_mass_frac = 0.12
+        self.tree_grow_min_loss_ratio = 0.95
+        self.tree_grow_hetero_easy = 1.0
+        self.tree_grow_hetero_hard = 1.0
+        self.tree_grow_require_feat_var_median = False
         self.tree_grow_force = False
         self.tree_grow_dense_iters = 1500
 

@@ -1,12 +1,10 @@
 #
-# Hierarchical Tree MoE for MoE+GNN (static / dynamic).
+# Hierarchical Tree MoE (--moe_arch dynamic_tree; methods: moe_tree, tree_gnn).
+# Canonical trainers: baseline | moe | moe_gnn (flat MoE + dual GNN).
 #
-# Dynamic = MoE+GNN + growing tree:
-#   AnchorGNN → h_gnn every step
-#   Dual-router at every INTERNAL node (incl. root):
-#     z = z_base(fv) + γ * z_gnn([fv ‖ h_gnn])
-#   Leaf experts always decode from raw view-conditioned input (never h_gnn).
-#   Selective growth replaces busy leaves with DualRouter + children.
+#   Base router at each INTERNAL node: z = z_base(fv) [+ γ z_gnn if enabled]
+#   Leaf experts decode raw view-conditioned input
+#   Selective growth replaces busy leaves with router + children
 #
 
 from __future__ import annotations
@@ -214,12 +212,13 @@ class AttributeTreeMoE(nn.Module):
             children.append(
                 TreeNode(lid, depth=1, is_leaf=True, expert=self._make_expert())
             )
-        # Dual GNN router at root (innovation): z = z_base(fv) + γ z_gnn([fv‖h_gnn])
+        # Root is an internal router over `branch_factor` leaf experts.
+        # GNN enabled for dynamic v1 when use_gnn_router=True.
         return TreeNode(
             node_id="root",
             depth=0,
             is_leaf=False,
-            router=self._make_router(use_gnn_router=self.use_gnn_router),
+            router=self._make_router(),
             child_nodes=children,
         )
 
@@ -500,15 +499,61 @@ class AttributeTreeMoE(nn.Module):
         self._leaf_feat_m2.clear()
         self._leaf_steps.clear()
 
+    @staticmethod
+    def _median(vals: List[float]) -> float:
+        """Even-n median = mean of two middle values (critical for 2-leaf trees)."""
+        if not vals:
+            return 1e-8
+        s = sorted(vals)
+        n = len(s)
+        if n % 2 == 1:
+            return max(s[n // 2], 1e-8)
+        return max(0.5 * (s[n // 2 - 1] + s[n // 2]), 1e-8)
+
+    def scene_loss_hetero(self) -> float:
+        """
+        MoE-hardness proxy H = L_max / median(L).
+        Homogeneous leaves (easy for MoE) → H ≈ 1; peaked hard leaf → H > 1.
+        """
+        details = self.leaf_growth_scores()
+        if not details:
+            return 1.0
+        L_vals = [d["L"] for d in details.values()]
+        return float(max(L_vals) / self._median(L_vals))
+
+    def grow_budget(
+        self,
+        hetero_easy: float = 1.08,
+        hetero_hard: float = 1.20,
+    ) -> Tuple[int, float]:
+        """
+        Scene-level expert budget from leaf-loss heterogeneity (Dynamic v4).
+
+          H < hetero_easy  → budget 0  (stay lean)
+          H < hetero_hard  → budget 1
+          else             → budget max_total_grows
+
+        Returns (remaining_grows, H).
+        """
+        H = self.scene_loss_hetero()
+        if H < float(hetero_easy):
+            budget = 0
+        elif H < float(hetero_hard):
+            budget = 1
+        else:
+            budget = int(self.max_total_grows)
+        remaining = max(0, budget - len(self._growth_history))
+        return remaining, H
+
     def leaf_growth_scores(self) -> Dict[str, Dict[str, float]]:
         """
-        Rank leaves by adaptive-capacity need (growth-policy v2):
-          S_e = mass_frac * (1 + 1.5 * feat_var) * (1 + L_e / median_L)
+        Rank leaves by capacity–difficulty mismatch (IT / Dynamic v4):
 
-        mass_frac  — traffic share (busy leaves need capacity)
-        feat_var   — residual heterogeneity of routed anchors (up-weighted)
-        L_e        — mass-weighted image loss (weak signal, but harmless)
-        neff       — 1 + feat_var / median(feat_var); diversity proxy for min_neff gate
+          R_e = L_e / median_L                         # relative difficulty
+          excess = max(0, R_e - 1)                     # only above-median hard
+          S_e = mass_frac * (1 + excess)^2 * (1 + 0.75 * feat_var)
+
+        Equal-sized experts ⇒ fixed capacity C ≈ median difficulty.
         """
         leaves = self.leaf_nodes()
         total_mass = sum(self._leaf_mass_sum.get(leaf.node_id, 0.0) for leaf in leaves)
@@ -529,21 +574,25 @@ class AttributeTreeMoE(nn.Module):
 
         if not mass_frac:
             return {}
-        L_vals = sorted(L.values())
-        med_L = max(L_vals[len(L_vals) // 2], 1e-8)
-        fv_vals = sorted(feat_var.values())
-        med_fv = max(fv_vals[len(fv_vals) // 2], 1e-8)
+        med_L = self._median(list(L.values()))
+        med_fv = self._median(list(feat_var.values()))
         out: Dict[str, Dict[str, float]] = {}
         for lid in mass_frac:
             fv = feat_var[lid]
-            score = mass_frac[lid] * (1.0 + 1.5 * fv) * (1.0 + L[lid] / med_L)
+            rel_L = L[lid] / med_L
+            excess = max(0.0, rel_L - 1.0)
+            score = mass_frac[lid] * ((1.0 + excess) ** 2) * (1.0 + 0.75 * fv)
             neff = 1.0 + fv / med_fv
             out[lid] = {
                 "score": score,
                 "mass_frac": mass_frac[lid],
                 "feat_var": fv,
                 "L": L[lid],
+                "rel_L": rel_L,
+                "excess": excess,
                 "neff": neff,
+                "med_L": med_L,
+                "med_fv": med_fv,
             }
         return out
 
@@ -604,8 +653,9 @@ class AttributeTreeMoE(nn.Module):
             node_id=self._next_id(f"{leaf_id}_R_"),
             depth=leaf.depth,
             is_leaf=False,
-            # Grown internals also use dual GNN routing (same as root).
-            router=self._make_router(self.grow_factor, use_gnn_router=self.use_gnn_router).to(device),
+            router=self._make_router(
+                self.grow_factor, use_gnn_router=self.use_gnn_router
+            ).to(device),
             child_nodes=children,
         )
         parent_node.child_nodes[child_idx] = new_internal
@@ -621,21 +671,40 @@ class AttributeTreeMoE(nn.Module):
 
     def select_grow_candidates(
         self,
-        min_score_ratio: float = 1.15,
+        min_score_ratio: float = 1.20,
         min_neff: float = 1.2,
         force_grow: bool = False,
         min_mass_frac: float = 0.15,
         bypass_neff: bool = False,
         near_miss_ratio: float = 0.98,
+        min_loss_ratio: float = 1.05,
+        hetero_easy: float = 1.08,
+        hetero_hard: float = 1.20,
+        require_feat_var_median: bool = True,
     ) -> List[Tuple[float, str]]:
         """
-        Rank growable leaves without mutating the tree.
+        Rank growable leaves without mutating the tree (IT v4 / expert budget).
 
-        Returns list of (score, leaf_id) sorted descending, or [] if none.
-        Sets self._last_grow_debug with the decision reason.
+        Scene budget from H = L_max / median_L (easy → 0 grows, hard → more).
+        Leaf gates:
+          - mass_frac >= min_mass_frac
+          - rel_L = L/med_L >= min_loss_ratio
+          - feat_var >= median feat_var (ΔI proxy; blocks fake outdoor grows)
+          - neff >= min_neff (unless bypass)
+          - score >= median(score) * min_score_ratio * near_miss
         """
         if not self.dynamic:
             self._last_grow_debug = "skip: not dynamic"
+            return []
+        remaining, hetero = self.grow_budget(
+            hetero_easy=hetero_easy, hetero_hard=hetero_hard
+        )
+        if remaining <= 0:
+            self._last_grow_debug = (
+                f"skip: budget=0 H={hetero:.3f} "
+                f"(easy<{hetero_easy} or exhausted; "
+                f"grows={len(self._growth_history)}, leaves={self.num_experts})"
+            )
             return []
         if len(self._growth_history) >= self.max_total_grows:
             self._last_grow_debug = (
@@ -657,77 +726,92 @@ class AttributeTreeMoE(nn.Module):
             self._last_grow_debug = (
                 f"skip: no growable leaves (leaves={self.num_experts}, "
                 f"stats={len(details)}, depth_cap={self.max_depth}, "
-                f"grows={len(self._growth_history)}/{self.max_total_grows})"
+                f"grows={len(self._growth_history)} rem={remaining}, H={hetero:.3f})"
             )
             return []
 
         growable.sort(reverse=True)
         scores_only = [g[0] for g in growable]
-        med = scores_only[len(scores_only) // 2]
+        med = self._median(scores_only)
         threshold = med * min_score_ratio
-        # Near-miss tolerance: accept S >= thr * 0.98 to avoid float edge skips.
         effective_thr = threshold * float(near_miss_ratio)
 
         candidates: List[Tuple[float, str]] = []
         neff_blocked = 0
+        loss_blocked = 0
+        fv_blocked = 0
         for sc, mass_frac, lid, d in growable:
             if mass_frac < min_mass_frac:
                 continue
+            rel_L = float(d.get("rel_L", d["L"] / max(d.get("med_L", 1e-8), 1e-8)))
+            if rel_L < float(min_loss_ratio):
+                loss_blocked += 1
+                continue
+            # ΔI proxy: only split leaves with above-median feature diversity.
+            if require_feat_var_median:
+                med_fv = float(d.get("med_fv", 0.0))
+                if float(d.get("feat_var", 0.0)) < med_fv:
+                    fv_blocked += 1
+                    continue
             neff = float(d.get("neff", 1.0))
             if (not bypass_neff) and neff < min_neff:
                 neff_blocked += 1
                 continue
-            # Score-only gate (no mass-dominate bypass). Soft outdoor scenes
-            # often have one leaf ~30% mass with flat scores; dominating on
-            # mass alone over-grows stump/garden and hurts vs flat MoE.
             if sc >= effective_thr:
                 candidates.append((sc, lid))
 
         if not candidates and force_grow:
             sc, mass_frac, lid, d = growable[0]
-            if mass_frac >= min_mass_frac * 0.5:
+            rel_L = float(d.get("rel_L", 0.0))
+            if mass_frac >= min_mass_frac * 0.5 and rel_L >= min_loss_ratio * 0.98:
                 candidates = [(sc, lid)]
                 self._last_grow_debug = (
                     f"force-cand {lid}: score={sc:.4f} mass={mass_frac:.3f} "
-                    f"feat_var={d['feat_var']:.4f} L={d['L']:.4f} (med={med:.4f})"
+                    f"rel_L={rel_L:.3f} feat_var={d['feat_var']:.4f} "
+                    f"L={d['L']:.4f} H={hetero:.3f} rem={remaining}"
                 )
             else:
                 self._last_grow_debug = (
-                    f"skip force: top leaf mass too small ({growable[0][1]:.4f})"
+                    f"skip force: top mass={growable[0][1]:.4f} "
+                    f"rel_L={float(growable[0][3].get('rel_L', 0)):.3f} "
+                    f"H={hetero:.3f}"
                 )
                 return []
         elif candidates:
             top = details[candidates[0][1]]
             self._last_grow_debug = (
                 f"cand {candidates[0][1]}: score={candidates[0][0]:.4f} "
-                f"mass={top['mass_frac']:.3f} feat_var={top['feat_var']:.4f} "
-                f"neff={top.get('neff', 0):.3f} "
+                f"mass={top['mass_frac']:.3f} rel_L={top.get('rel_L', 0):.3f} "
+                f"excess={top.get('excess', 0):.3f} fv={top.get('feat_var', 0):.3f} "
+                f"H={hetero:.3f} rem={remaining} "
                 f"(thr={threshold:.4f} eff={effective_thr:.4f}, n_cand={len(candidates)})"
             )
         else:
             self._last_grow_debug = (
                 f"skip: no leaf above thr={threshold:.4f} eff={effective_thr:.4f} "
                 f"(top={growable[0][0]:.4f} mass={growable[0][1]:.3f}, "
-                f"neff_blocked={neff_blocked}, force={force_grow})"
+                f"loss_blocked={loss_blocked}, fv_blocked={fv_blocked}, "
+                f"neff_blocked={neff_blocked}, H={hetero:.3f} rem={remaining})"
             )
             return []
         return candidates
 
     def maybe_grow(
         self,
-        min_score_ratio: float = 1.15,
+        min_score_ratio: float = 1.20,
         min_neff: float = 1.2,
         max_grows: int = 1,
         force_grow: bool = False,
         min_mass_frac: float = 0.15,
         bypass_neff: bool = False,
         near_miss_ratio: float = 0.98,
+        min_loss_ratio: float = 1.05,
+        hetero_easy: float = 1.08,
+        hetero_hard: float = 1.20,
+        require_feat_var_median: bool = True,
     ) -> List[str]:
         """
-        Grow up to `max_grows` highest-scoring growable leaves.
-
-        Primary criterion: score >= median(score) * min_score_ratio * near_miss
-        AND mass_frac >= min_mass_frac AND (neff >= min_neff or bypass_neff).
+        Grow up to `max_grows` highest-scoring growable leaves (IT v4).
         """
         candidates = self.select_grow_candidates(
             min_score_ratio=min_score_ratio,
@@ -736,6 +820,10 @@ class AttributeTreeMoE(nn.Module):
             min_mass_frac=min_mass_frac,
             bypass_neff=bypass_neff,
             near_miss_ratio=near_miss_ratio,
+            min_loss_ratio=min_loss_ratio,
+            hetero_easy=hetero_easy,
+            hetero_hard=hetero_hard,
+            require_feat_var_median=require_feat_var_median,
         )
         if not candidates:
             return []

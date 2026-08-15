@@ -48,4 +48,4 @@ PY
 echo ""
 echo "Done. Activate with: conda activate $ENV_NAME"
 echo "Place datasets under: $PROJECT_DIR/data/"
-echo "Train a scene with: bash single_train.sh"
+echo "Train a scene with: bash train_method.sh --method baseline -d <dataset/scene> -g 0"
